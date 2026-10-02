@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>太空射擊游戲</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; min-height: 100vh; display: grid; place-items: center;
+            background: radial-gradient(ellipse at bottom, #172b58 0%, #080d20 65%, #030611 100%);
+            color: #eaf6ff; font-family: system-ui, sans-serif;
+        }
+        .game-wrap { width: min(94vw, 800px); text-align: center; }
+        h1 { margin: 0 0 10px; color: #75eaff; letter-spacing: 3px; text-shadow: 0 0 16px #24cfff; }
+        .hud { display: flex; justify-content: space-between; padding: 8px 12px; font-weight: 700; }
+        #score { color: #ffe873; }
+        #special { color: #ff8df3; }
+        canvas {
+            display: block; width: 100%; aspect-ratio: 4 / 3; border: 2px solid #3bdcff;
+            border-radius: 10px; background: #050a1b; box-shadow: 0 0 28px #087eaa88;
+        }
+        .help { margin: 9px 0 0; color: #b6c9e8; font-size: 14px; }
+        button {
+            border: 1px solid #6af0ff; border-radius: 6px; padding: 8px 18px;
+            background: #0a2942; color: white; font-weight: 700; cursor: pointer;
+        }
+        button:hover { background: #12466b; }
+        #soundBtn { margin-top: 8px; }
+    </style>
+</head>
+<body>
+<main class="game-wrap">
+    <h1>太空射擊</h1>
+    <div class="hud"><span>分數：<span id="score">0</span></span><span>大招：<span id="special">3</span>/3</span><span>護盾：<span id="shield">0</span>/1</span><span>生命：<span id="lives">3</span></span></div>
+    <canvas id="game" width="800" height="600" aria-label="太空射擊遊戲"></canvas>
+    <p class="help">移動：方向鍵或 W A S D　｜　射擊：空白鍵　｜　大招：K（2秒激光，每50分充能）　｜　護盾：L（3秒，每50分充能）</p>
+    <button id="soundBtn" type="button">音效：開</button>
+</main>
+<script>
+(() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const livesEl = document.getElementById('lives');
+    const specialEl = document.getElementById('special');
+    const shieldEl = document.getElementById('shield');
+    const soundBtn = document.getElementById('soundBtn');
+    const keys = Object.create(null);
+    let audio, soundOn = true, score = 0, lives = 3, gameOver = false;
+    let specialCharges = 3, nextChargeAt = 50, shieldCharges = 0, nextShieldAt = 50, bossLevel = 0, specialFlash = 0;
+    let player, bullets, enemyBullets, enemies, bosses, stars, powerups, lastShot = 0, spawnTimer = 0, nextBossAt = 100, upgradeText = '', upgradeTimer = 0, laserTimer = 0, shieldTimer = 0, droneCount = 0, cheerTimer = 0, cheerText = '';
+
+    function playSound(freq, duration, type = 'sine', volume = 0.045) {
+        if (!soundOn) return;
+        try {
+            audio ||= new (window.AudioContext || window.webkitAudioContext)();
+            if (audio.state === 'suspended') audio.resume();
+            const oscillator = audio.createOscillator();
+            const gain = audio.createGain();
+            oscillator.type = type;
+            oscillator.frequency.setValueAtTime(freq, audio.currentTime);
+            oscillator.frequency.exponentialRampToValueAtTime(Math.max(40, freq * 0.45), audio.currentTime + duration);
+            gain.gain.setValueAtTime(volume, audio.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + duration);
+            oscillator.connect(gain); gain.connect(audio.destination);
+            oscillator.start(); oscillator.stop(audio.currentTime + duration);
+        } catch (_) { /* Audio is optional when the browser does not support it. */ }
+    }
+    function reset() {
+        score = 0; lives = 3; gameOver = false; nextBossAt = 100; nextChargeAt = 50; specialCharges = 3; shieldCharges = 0; nextShieldAt = 50; bossLevel = 0; specialFlash = 0; spawnTimer = 0; upgradeText = ''; upgradeTimer = 0; laserTimer = 0; shieldTimer = 0; droneCount = 0; cheerTimer = 0; cheerText = '';
+        player = { x: 400, y: 535, w: 38, h: 38, invulnerable: 0, power: 1, scatter: false, moveSpeed: 340, shotCooldown: 220, shotSpeed: 540 };
+        bullets = []; enemyBullets = []; enemies = []; powerups = []; bosses = [];
+        stars = Array.from({ length: 90 }, () => ({ x: Math.random() * 800, y: Math.random() * 600, speed: 0.5 + Math.random() * 2, size: Math.random() * 2 + 0.5 }));
+        scoreEl.textContent = score; livesEl.textContent = lives; specialEl.textContent = specialCharges; shieldEl.textContent = shieldCharges;
+    }
+    function addScore(points) {
+        score += points;
+        while (score >= nextChargeAt) {
+            if (specialCharges < 3) specialCharges++;
+            nextChargeAt += 50;
+        }
+        while (score >= nextShieldAt) {
+            shieldCharges = 1;
+            nextShieldAt += 50;
+        }
+        scoreEl.textContent = score;
+        specialEl.textContent = specialCharges;
+        shieldEl.textContent = shieldCharges;
+    }
+    function defeatBoss(target) {
+        bosses = bosses.filter(b => b !== target);
+        droneCount = Math.min(4, droneCount + 1);
+        cheerText = ['YES!', 'NICE!', 'GOOD!'][Math.floor(Math.random() * 3)];
+        cheerTimer = 2.5;
+        applyBossUpgrade();
+        playSound(100, 0.65, 'sawtooth', 0.08);
+    }
+    function dropPowerup(x, y) {
+        if (Math.random() < 0.2) powerups.push({ x, y, type: ['yellow', 'green', 'white'][Math.floor(Math.random() * 3)] });
+    }
+    function useSpecial() {
+        if (gameOver || specialCharges <= 0) return;
+        specialCharges--;
+        specialEl.textContent = specialCharges;
+        laserTimer = 2;
+        specialFlash = 0.45;
+        playSound(520, 2, 'sawtooth', 0.035);
+    }
+    function useShield() {
+        if (gameOver || shieldCharges <= 0) return;
+        shieldCharges = 0;
+        shieldEl.textContent = shieldCharges;
+        shieldTimer = 3;
+        upgradeText = '護盾 3秒'; upgradeTimer = 1.5;
+        playSound(760, 0.18, 'triangle', 0.06);
+    }
+    function getDronePositions() {
+        return Array.from({ length: droneCount }, (_, i) => {
+            const side = i < 2 ? -1 : 1, row = i % 2;
+            return { x: player.x + side * (34 + row * 24), y: player.y + (row ? 16 : -8) };
+        });
+    }
+    function applyBossUpgrade() {
+        player.power = Math.min(5, player.power + 1);
+        player.scatter = true;
+        player.moveSpeed = 340 + (player.power - 1) * 26;
+        player.shotCooldown = Math.max(110, 220 - (player.power - 1) * 18);
+        player.shotSpeed = 540 + (player.power - 1) * 35;
+        player.w = 38 + (player.power - 1) * 3;
+        player.h = 38 + (player.power - 1) * 3;
+        upgradeText = `强化 Lv.${player.power}`;
+        upgradeTimer = 1.5;
+        playSound(720, 0.3, 'triangle', 0.08);
+    }
+    function drawShip(x, y, size, color, enemy = false) {
+        ctx.save(); ctx.translate(x, y); ctx.fillStyle = color;
+        ctx.shadowColor = color; ctx.shadowBlur = 14;
+        ctx.beginPath();
+        if (enemy) {
+            ctx.moveTo(-size, -size * 0.45); ctx.lineTo(-size * 0.5, size * 0.15);
+            ctx.lineTo(0, size * 0.5); ctx.lineTo(size * 0.5, size * 0.15);
+            ctx.lineTo(size, -size * 0.45); ctx.lineTo(0, -size * 0.15);
+        } else {
+            ctx.moveTo(0, -size); ctx.lineTo(size * 0.72, size * 0.8);
+            ctx.lineTo(0, size * 0.45); ctx.lineTo(-size * 0.72, size * 0.8);
+        }
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#dffaff'; ctx.shadowBlur = 0;
+        ctx.beginPath(); ctx.arc(0, 0, Math.max(2, size * 0.14), 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+    }
+    function spawnBoss() {
+        bossLevel++;
+        const count = bossLevel >= 3 && Math.random() < 0.35 ? 2 : 1;
+        for (let i = 0; i < count; i++) {
+            const hp = 20 + Math.floor(score / 100) * 4 + (bossLevel - 1) * 12;
+            bosses.push({ x: count === 1 ? 400 : 260 + i * 280, y: 105, baseY: 105, w: 128, h: 68, hp, maxHp: hp, direction: i ? -1 : 1, shotTimer: 0 });
+        }
+        playSound(220, 0.5, 'sawtooth', 0.08);
+    }
+    function hitPlayer() {
+        if (player.invulnerable > 0 || shieldTimer > 0 || gameOver) return;
+        lives--; livesEl.textContent = lives; player.invulnerable = 1.2;
+        playSound(130, 0.35, 'sawtooth', 0.08);
+        if (lives <= 0) gameOver = true;
+    }
+    function update(dt) {
+        if (upgradeTimer > 0) {
+            upgradeTimer = Math.max(0, upgradeTimer - dt);
+            if (upgradeTimer === 0) upgradeText = '';
+        }
+        for (const star of stars) { star.y += star.speed * dt * 60; if (star.y > 600) { star.y = 0; star.x = Math.random() * 800; } }
+        if (gameOver) return;
+        laserTimer = Math.max(0, laserTimer - dt);
+        shieldTimer = Math.max(0, shieldTimer - dt);
+        if (keys.ArrowLeft || keys.a || keys.A) player.x -= player.moveSpeed * dt;
+        if (keys.ArrowRight || keys.d || keys.D) player.x += player.moveSpeed * dt;
+        if (keys.ArrowUp || keys.w || keys.W) player.y -= player.moveSpeed * dt;
+        if (keys.ArrowDown || keys.s || keys.S) player.y += player.moveSpeed * dt;
+        player.x = Math.max(25, Math.min(775, player.x));
+        player.y = Math.max(25, Math.min(575, player.y));
+        player.invulnerable = Math.max(0, player.invulnerable - dt);
+        if ((keys.Space || keys[' ']) && performance.now() - lastShot > player.shotCooldown) {
+            const count = Math.min(player.power, 5);
+            for (let i = 0; i < count; i++) {
+                const angle = player.scatter ? (i - (count - 1) / 2) * 0.16 : 0;
+                const offset = player.scatter ? 0 : (i - (count - 1) / 2) * 16;
+                bullets.push({ x: player.x + offset, y: player.y - 24, vx: Math.sin(angle) * player.shotSpeed, vy: -Math.cos(angle) * player.shotSpeed });
+            }
+            for (const drone of getDronePositions()) {
+                for (let i = 0; i < count; i++) {
+                    const angle = player.scatter ? (i - (count - 1) / 2) * 0.16 : 0;
+                    const offset = player.scatter ? 0 : (i - (count - 1) / 2) * 16;
+                    bullets.push({ x: drone.x + offset, y: drone.y - 12, vx: Math.sin(angle) * player.shotSpeed, vy: -Math.cos(angle) * player.shotSpeed, drone: true });
+                }
+            }
+            lastShot = performance.now();
+            playSound(player.power >= 3 ? 700 : 620, 0.09, 'square', 0.025);
+        }
+        bullets.forEach(b => { b.x += b.vx * dt; b.y += b.vy * dt; });
+        enemyBullets.forEach(b => { b.x += b.vx * dt; b.y += b.vy * dt; });
+        bullets = bullets.filter(b => b.y > -10);
+        enemyBullets = enemyBullets.filter(b => b.y < 620 && b.x > -10 && b.x < 810);
+
+        if (score >= nextBossAt && !bosses.length) { spawnBoss(); nextBossAt += 100; }
+        if (!bosses.length) {
+            spawnTimer += dt;
+            if (spawnTimer > Math.max(0.28, 0.8 - bossLevel * 0.055)) {
+                spawnTimer = 0; enemies.push({ x: 35 + Math.random() * 730, y: -25, w: 30, h: 30, speed: 90 + bossLevel * 12 + Math.random() * (55 + bossLevel * 4), shotTimer: 1.8 + Math.random() * 1.5 });
+            }
+        }
+        enemies.forEach(e => e.y += e.speed * dt);
+        powerups.forEach(p => p.y += 100 * dt);
+        powerups = powerups.filter(p => {
+            if (Math.hypot(p.x - player.x, p.y - player.y) < 30) {
+                if (p.type === 'yellow') player.power = Math.min(5, player.power + 1);
+                if (p.type === 'green') { lives++; livesEl.textContent = lives; }
+                if (p.type === 'white') shieldTimer = 3;
+                upgradeText = p.type === 'yellow' ? '子彈強化' : p.type === 'green' ? '生命 +1' : '護盾 3秒'; upgradeTimer = 1.5;
+                playSound(760, 0.18, 'triangle', 0.06);
+                return false;
+            }
+            return p.y < 620;
+        });
+        enemies.forEach(e => {
+            e.shotTimer -= dt;
+            if (e.shotTimer <= 0 && e.y > 0 && e.y < 500) {
+                const angle = Math.atan2(player.y - e.y, player.x - e.x);
+                enemyBullets.push({ x: e.x, y: e.y + 12, vx: Math.cos(angle) * 145, vy: Math.sin(angle) * 145 });
+                e.shotTimer = 2.8 + Math.random() * 1.8;
+            }
+        });
+        enemies = enemies.filter(e => {
+            if (e.y > 630) return false;
+            if (Math.abs(e.x - player.x) < 28 && Math.abs(e.y - player.y) < 28) { hitPlayer(); return false; }
+            return true;
+        });
+        bosses.forEach(boss => {
+            const bossSpeed = 125 + bossLevel * 34;
+            boss.x += boss.direction * bossSpeed * dt;
+            boss.y = boss.baseY + Math.sin(performance.now() / (550 - Math.min(250, bossLevel * 35))) * (8 + bossLevel * 2);
+            if (boss.x > 690 || boss.x < 110) boss.direction *= -1;
+            boss.shotTimer += dt;
+            if (boss.shotTimer > Math.max(0.24, 0.75 - bossLevel * 0.06)) {
+                boss.shotTimer = 0;
+                const dx = player.x - boss.x, dy = player.y - boss.y;
+                const pattern = bossLevel >= 3 ? [-0.36, -0.18, 0, 0.18, 0.36] : [-0.18, 0, 0.18];
+                pattern.forEach(offset => {
+                    const angle = Math.atan2(dy, dx) + offset;
+                    const speed = 210 + bossLevel * 16;
+                    enemyBullets.push({ x: boss.x, y: boss.y + 24, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed });
+                });
+                playSound(180, 0.12, 'triangle', 0.025);
+            }
+            if (Math.abs(boss.x - player.x) < 76 && Math.abs(boss.y - player.y) < 42) hitPlayer();
+        });
+        if (laserTimer > 0) {
+            const laserXs = [player.x, ...getDronePositions().map(drone => drone.x)];
+            enemies = enemies.filter(e => {
+                if (laserXs.some(x => Math.abs(e.x - x) < 14)) { addScore(10); dropPowerup(e.x, e.y); playSound(880, 0.08, 'triangle', 0.025); return false; }
+                return true;
+            });
+            bosses.forEach(boss => { if (laserXs.some(x => Math.abs(boss.x - x) < boss.w / 2 + 14)) boss.hp -= 12 * dt; });
+            bosses.filter(boss => boss.hp <= 0).forEach(defeatBoss);
+        }
+        for (let i = bullets.length - 1; i >= 0; i--) {
+            const b = bullets[i]; let hit = false;
+            for (let j = enemies.length - 1; j >= 0; j--) {
+                const e = enemies[j];
+                if (Math.abs(b.x - e.x) < 20 && Math.abs(b.y - e.y) < 20) {
+                    enemies.splice(j, 1); bullets.splice(i, 1); addScore(10); dropPowerup(e.x, e.y); hit = true;
+                    playSound(880, 0.13, 'triangle', 0.06); break;
+                }
+            }
+            const target = !hit && bosses.find(boss => b.x > boss.x - boss.w / 2 && b.x < boss.x + boss.w / 2 && b.y > boss.y - boss.h / 2 && b.y < boss.y + boss.h / 2);
+            if (target) {
+                bullets.splice(i, 1); target.hp--; playSound(420, 0.06, 'square', 0.035);
+                if (target.hp <= 0) defeatBoss(target);
+            }
+        }
+        enemyBullets = enemyBullets.filter(b => {
+            if (Math.hypot(b.x - player.x, b.y - player.y) < 18) { hitPlayer(); return false; }
+            return true;
+        });
+        cheerTimer = Math.max(0, cheerTimer - dt);
+    }
+    function draw() {
+        ctx.clearRect(0, 0, 800, 600);
+        ctx.fillStyle = '#050a1b'; ctx.fillRect(0, 0, 800, 600);
+        ctx.fillStyle = '#d5edff';
+        for (const star of stars) { ctx.globalAlpha = 0.45 + star.size * 0.2; ctx.fillRect(star.x, star.y, star.size, star.size); }
+        ctx.globalAlpha = 1;
+        if (laserTimer > 0) {
+            ctx.save(); ctx.globalAlpha = 0.82; ctx.shadowColor = '#7dfaff'; ctx.shadowBlur = 24;
+            const laserPoints = [{ x: player.x, y: player.y }, ...getDronePositions()];
+            laserPoints.forEach(point => {
+                ctx.fillStyle = '#baffff'; ctx.fillRect(point.x - 8, 0, 16, point.y - 18);
+                ctx.fillStyle = '#fff'; ctx.fillRect(point.x - 3, 0, 6, point.y - 18);
+            });
+            ctx.restore();
+        }
+        if (specialFlash > 0) {
+            ctx.save(); ctx.globalAlpha = specialFlash / 0.45; ctx.strokeStyle = '#ff8df3'; ctx.lineWidth = 6;
+            ctx.beginPath(); ctx.arc(player.x, player.y, (0.45 - specialFlash) * 950, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+            specialFlash = Math.max(0, specialFlash - 1 / 60);
+        }
+        bullets.forEach(b => { ctx.fillStyle = '#8fffff'; ctx.shadowColor = '#00eaff'; ctx.shadowBlur = 12; ctx.fillRect(b.x - 2, b.y - 9, 4, 14); });
+        ctx.shadowBlur = 0;
+        enemies.forEach(e => drawShip(e.x, e.y, 17, '#ff658a', true));
+        powerups.forEach(p => {
+            const color = p.type === 'yellow' ? '#ffe45e' : p.type === 'green' ? '#65ff8a' : '#ffffff';
+            ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(Math.PI / 4); ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 14; ctx.fillRect(-7, -7, 14, 14); ctx.restore();
+        });
+        enemyBullets.forEach(b => { ctx.fillStyle = '#ff667e'; ctx.beginPath(); ctx.arc(b.x, b.y, 6, 0, Math.PI * 2); ctx.fill(); });
+        bosses.forEach(boss => {
+            drawShip(boss.x, boss.y, 58, '#c36bff', true);
+            const barW = 170, barX = boss.x - barW / 2, barY = boss.y - boss.h / 2 - 23;
+            ctx.fillStyle = '#260f3b'; ctx.fillRect(barX, barY, barW, 10);
+            ctx.fillStyle = '#ff4f9a'; ctx.fillRect(barX, barY, barW * Math.max(0, boss.hp / boss.maxHp), 10);
+            ctx.strokeStyle = '#fff'; ctx.strokeRect(barX, barY, barW, 10);
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 12px system-ui'; ctx.textAlign = 'center'; ctx.fillText(`BOSS ${boss.hp}/${boss.maxHp}`, boss.x, barY - 5);
+        });
+        const shipSize = 23 + (player.power - 1) * 2;
+        if (shieldTimer > 0) {
+            ctx.save(); ctx.strokeStyle = '#fff'; ctx.shadowColor = '#b9ffff'; ctx.shadowBlur = 18; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.ellipse(player.x, player.y, 35, 30, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+        }
+        if (!gameOver && (player.invulnerable === 0 || Math.floor(performance.now() / 100) % 2 === 0)) drawShip(player.x, player.y, shipSize, '#42e9ff');
+        getDronePositions().forEach(drone => drawShip(drone.x, drone.y, 10, '#ffda70'));
+        if (upgradeText && upgradeTimer > 0) {
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 22px system-ui';
+            ctx.fillStyle = `rgba(117, 234, 255, ${Math.min(1, upgradeTimer / 1.5)})`;
+            ctx.fillText(upgradeText, 400, 80);
+        }
+        if (gameOver) {
+            ctx.fillStyle = '#000b'; ctx.fillRect(0, 0, 800, 600);
+            ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = 'bold 48px system-ui'; ctx.fillText('遊戲結束', 400, 270);
+            ctx.font = '24px system-ui'; ctx.fillText(`最終分數：${score}`, 400, 315);
+            ctx.font = '18px system-ui'; ctx.fillStyle = '#9beeff'; ctx.fillText('按 Enter 重新開始', 400, 360);
+        }
+    }
+    let previous = 0;
+    function frame(now) { const dt = Math.min((now - previous) / 1000, 0.04); previous = now; update(dt); draw(); requestAnimationFrame(frame); }
+    window.addEventListener('keydown', event => {
+        if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Space'].includes(event.key)) event.preventDefault();
+        keys[event.key] = true;
+        if (event.key === 'Enter' && gameOver) reset();
+        if (event.key.toLowerCase() === 'k' && !event.repeat) useSpecial();
+        if (event.key.toLowerCase() === 'l' && !event.repeat) useShield();
+        if (event.key === ' ' && audio?.state === 'suspended') audio.resume();
+    });
+    window.addEventListener('keyup', event => { keys[event.key] = false; });
+    soundBtn.addEventListener('click', () => { soundOn = !soundOn; soundBtn.textContent = `音效：${soundOn ? '開' : '關'}`; if (soundOn) playSound(660, 0.12); });
+    reset(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
